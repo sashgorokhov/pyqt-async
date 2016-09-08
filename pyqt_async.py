@@ -4,11 +4,12 @@ Asynchronous tools for PyQt apps.
 This module allows you to write an asynchronous code with ease of a single decorator.
 """
 
+import collections
 import functools
 import logging
-import collections
+import time
 from concurrent import futures
-
+from contextlib import contextmanager
 
 try:
     from PyQt4 import QtCore
@@ -21,9 +22,61 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _fobj(obj):
+    """Format object str representation"""
+    return str(hex(id(obj))) + " " + str(obj.__class__.__qualname__)
+
+
+# For logging purposes
+class _Timer(object):
+    start = None
+    end = None
+
+    @property
+    def elapsed(self):
+        if self.end is None:
+            raise ValueError(".end is not set")
+        return self.end - self.start
+
+    def __init__(self, start):
+        self.start = start
+
+    def __str__(self):
+        return '{:.2f}s'.format(self.elapsed)
+
+
+@contextmanager
+def timing():
+    """
+    :rtype: _Timer
+    """
+    start = time.time()
+    timer = _Timer(start)
+    try:
+        yield timer
+    except:
+        pass
+    end = time.time()
+    timer.end = end
+
+
+@contextmanager
+def object_timer(obj, msg=None):
+    try:
+        with timing() as timer:
+            yield timer
+    finally:
+        try:
+            logger.info("%s completed in %s: %s", _fobj(obj), timer, msg)
+        except ReferenceError:
+            logger.exception()
+
+
 def process_events():
     """Default event processing function"""
-    QApplication.instance().processEvents()
+    with timing() as timer:
+        QApplication.instance().processEvents()
+    logger.debug("Processed events in {}".format(timer))
 
 
 class BaseThread(QtCore.QThread):
@@ -34,6 +87,7 @@ class BaseThread(QtCore.QThread):
         super(BaseThread, self).__init__(*args, **kwargs)
 
     def __del__(self):
+        logger.warning("%s will be destroyed", _fobj(self))
         self.wait()
 
 
@@ -61,6 +115,7 @@ class FutureThread(BaseThread):
         :rtype: concurrent.futures.Future
         """
         super(FutureThread, self).start(*args, **kwargs)
+        logger.info("%s started", _fobj(self))
         return self.future
 
     def run(self):
@@ -68,15 +123,19 @@ class FutureThread(BaseThread):
         Main future logic. Do not override this, or it won't work as expected.
         """
         if not self.future.set_running_or_notify_cancel():
+            logger.info("%s cancelled", _fobj(self))
             return
         try:
-            result = self.work()
+            with object_timer(self, "work done"):
+                result = self.work()
         except Exception as e:
             self.future.set_exception(e)
+            logger.exception("%s got an exception", _fobj(self))
             return
         else:
             self.future.set_result(result)
-        return result
+            logger.info("%s got result", _fobj(self))
+            # return result
 
     def work(self):
         """
@@ -139,6 +198,7 @@ class GeneratorThread(QtCore.QObject):
 
         self.generator = generator
         self.future = futures.Future()
+        self.results = list()
 
         self._execute_next.connect(self.next)
         self._execute_next.emit()
@@ -153,6 +213,7 @@ class GeneratorThread(QtCore.QObject):
         """
         :param concurrent.futures.Future future:
         """
+        logger.info("%s %s sending: %s", _fobj(self), str(self.generator), str(future))
         if future._exception:
             self.generator.throw(future.exception())
         else:
@@ -169,6 +230,7 @@ class GeneratorThread(QtCore.QObject):
         except StopIteration:
             return
         self._execute_next.emit()
+        logger.debug("%s %s scheduled next()", _fobj(self), str(self.generator))
 
     def handle_result(self, result):
         """
@@ -189,20 +251,27 @@ class GeneratorThread(QtCore.QObject):
         """
         Executes next iteration of generator.
         """
+        logger.debug("%s %s executing next()", _fobj(self), str(self.generator))
         if self.future.cancelled() or (not self.future.running() and not self.future.set_running_or_notify_cancel()):
+            logger.info("%s %s cancelled", _fobj(self), str(self.generator))
             return
         self.process_events()
         try:
-            result = next(self.generator)
+            with object_timer(self.generator, "next() done"):
+                result = next(self.generator)
         except StopIteration:
-            self.future.set_result(None)
+            self.future.set_result(self.results)
+            logger.info("%s %s got StopIteration", _fobj(self), str(self.generator))
             return
         except Exception as e:
             self.future.set_exception(e)
+            logger.exception("%s %s got an exception", _fobj(self), str(self.generator))
             raise
-
-        if self.handle_result(result):
-            self._execute_next.emit()
+        else:
+            if self.handle_result(result):
+                self._execute_next.emit()
+                self.results.append(result)
+                logger.debug("%s %s scheduled next()", _fobj(self), str(self.generator))
 
 
 class GeneratorExecutor(futures.Executor):
@@ -222,3 +291,24 @@ def generator_executor(func):
         with GeneratorExecutor() as executor:
             return executor.submit(func, *args, **kwargs)
     return wrapper
+
+
+    # class BaseTask(object):
+    #    pass
+    #
+    #
+    # class Task(BaseTask):
+    #    pass
+    #
+    #
+    # class ListTask(BaseTask):
+    #    def __init__(self, *args):
+    #        pass
+    #
+    #
+    # class ParallelListTask(BaseTask):
+    #    pass
+    #
+    #
+    # class MapTask(BaseTask):
+    #    pass
